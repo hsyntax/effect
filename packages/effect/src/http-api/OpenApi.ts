@@ -292,7 +292,8 @@ function processAnnotation<Services, S, I>(
  * every member is a reference to an object component and one required string
  * literal property, such as `_tag`, selects exactly one member for each value.
  * When several properties qualify, `_tag` is used if it is one of them;
- * otherwise no discriminator is emitted.
+ * otherwise no discriminator is emitted. A `null` member stays outside the
+ * discriminated union, as with `Schema.NullOr`.
  *
  * **Gotchas**
  *

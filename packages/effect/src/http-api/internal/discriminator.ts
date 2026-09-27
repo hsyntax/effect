@@ -22,6 +22,10 @@ interface ObjectComponent {
  * When several properties qualify, `_tag` is used if it is one of them;
  * otherwise no discriminator is added.
  *
+ * A union with one `{ "type": "null" }` member is rewritten to
+ * `[{ <objects>, discriminator }, { "type": "null" }]`, the shape that
+ * `Schema.NullOr` of a union already produces.
+ *
  * @internal
  */
 export function addDiscriminators(
@@ -74,10 +78,24 @@ export function addDiscriminators(
       }
       InternalRecord.assignProperty(out, key, walked)
     }
-    const members = getUnionMembers(out)
-    if (members !== undefined && !Object.hasOwn(out, "discriminator")) {
-      const discriminator = getDiscriminator(members)
-      if (discriminator !== undefined) out.discriminator = discriminator
+    const union = getUnion(out)
+    if (union !== undefined && !Object.hasOwn(out, "discriminator")) {
+      const discriminator = getDiscriminator(union.members)
+      if (discriminator !== undefined) {
+        out.discriminator = discriminator
+      } else {
+        // `Schema.Union([A, B, Schema.Null])` puts `null` next to the objects. Nest the
+        // objects in their own union, as `Schema.NullOr(Schema.Union([A, B]))` does, so
+        // the discriminator describes only object members.
+        const nullable = splitNull(union.members)
+        const inner = nullable === undefined ? undefined : getDiscriminator(nullable.objects)
+        if (nullable !== undefined && inner !== undefined) {
+          InternalRecord.assignProperty(out, union.keyword, [
+            { [union.keyword]: nullable.objects, discriminator: inner },
+            nullable.nullMember
+          ])
+        }
+      }
     }
     return out as A
   }
@@ -148,11 +166,29 @@ export function addDiscriminators(
   }
 }
 
-function getUnionMembers(schema: Record<string, unknown>): ReadonlyArray<unknown> | undefined {
+function getUnion(
+  schema: Record<string, unknown>
+): { readonly keyword: "oneOf" | "anyOf"; readonly members: ReadonlyArray<unknown> } | undefined {
   const oneOf = Array.isArray(schema.oneOf) ? schema.oneOf : undefined
   const anyOf = Array.isArray(schema.anyOf) ? schema.anyOf : undefined
   // A discriminator cannot say which keyword it applies to when both are present.
-  return oneOf !== undefined && anyOf !== undefined ? undefined : oneOf ?? anyOf
+  if (oneOf !== undefined && anyOf !== undefined) return undefined
+  if (oneOf !== undefined) return { keyword: "oneOf", members: oneOf }
+  if (anyOf !== undefined) return { keyword: "anyOf", members: anyOf }
+  return undefined
+}
+
+function splitNull(
+  members: ReadonlyArray<unknown>
+): { readonly objects: ReadonlyArray<unknown>; readonly nullMember: unknown } | undefined {
+  const objects = members.filter((member) => !isNullSchema(member))
+  return members.length - objects.length === 1
+    ? { objects, nullMember: members.find(isNullSchema) }
+    : undefined
+}
+
+function isNullSchema(schema: unknown): boolean {
+  return Predicate.isObject(schema) && schema.type === "null" && Object.keys(schema).length === 1
 }
 
 function getComponentKey(ref: string): string | undefined {

@@ -1011,6 +1011,32 @@ describe("OpenApi", () => {
       assert.strictEqual(mapping?.["__proto__"], "#/components/schemas/A")
     })
 
+    it("nests the object members of a union with a null member, like NullOr", () => {
+      const A = Schema.Struct({ type: Schema.Literal("a") }).annotate({ identifier: "A" })
+      const B = Schema.Struct({ type: Schema.Literal("b") }).annotate({ identifier: "B" })
+      const spec = OpenApi.fromApi(makePayloadApi({
+        flat: Schema.Union([A, B, Schema.Null]),
+        flatOneOf: Schema.Union([A, B, Schema.Null], { mode: "oneOf" }),
+        nullOr: Schema.NullOr(Schema.Union([A, B]))
+      }))
+      const nested = (keyword: "anyOf" | "oneOf") => ({
+        [keyword]: [
+          {
+            [keyword]: [{ $ref: "#/components/schemas/A" }, { $ref: "#/components/schemas/B" }],
+            discriminator: {
+              propertyName: "type",
+              mapping: { a: "#/components/schemas/A", b: "#/components/schemas/B" }
+            }
+          },
+          { type: "null" }
+        ]
+      })
+
+      assert.deepStrictEqual(getPayloadProperty(spec, "flat"), nested("anyOf"))
+      assert.deepStrictEqual(getPayloadProperty(spec, "flatOneOf"), nested("oneOf"))
+      assert.deepStrictEqual(getPayloadProperty(spec, "nullOr"), nested("anyOf"))
+    })
+
     it("does not add a discriminator when no single property selects each member", () => {
       const KindA = Schema.Struct({ kind: Schema.Literal("a"), mode: Schema.Literal("1") }).annotate({
         identifier: "KindA"
@@ -1034,12 +1060,12 @@ describe("OpenApi", () => {
         ]),
         sharedValue: Schema.Union([SameA, SameB]),
         optionalKey: Schema.Union([OptionalA, RequiredB]),
-        nullable: Schema.NullOr(RequiredB)
+        singleObjectOrNull: Schema.NullOr(RequiredB)
       })
 
       const spec = OpenApi.fromApi(Api)
 
-      for (const name of ["ambiguous", "inline", "sharedValue", "optionalKey", "nullable"]) {
+      for (const name of ["ambiguous", "inline", "sharedValue", "optionalKey", "singleObjectOrNull"]) {
         const schema = getPayloadProperty(spec, name)
         assert.isDefined(schema?.anyOf, name)
         assert.notProperty(schema, "discriminator", name)
