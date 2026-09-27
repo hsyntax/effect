@@ -923,4 +923,127 @@ describe("OpenApi", () => {
 
     assert.throws(() => OpenApi.fromApi(Api), /Conflicting OpenAPI security scheme: __proto__/)
   })
+
+  describe("discriminator", () => {
+    const makePayloadApi = (fields: Schema.Struct.Fields) =>
+      HttpApi.make("Api").add(
+        HttpApiGroup.make("test").add(HttpApiEndpoint.post("create", "/create", { payload: Schema.Struct(fields) }))
+      )
+
+    const getPayloadProperty = (spec: OpenApi.OpenAPISpec, name: string) => {
+      const schema = spec.paths["/create"]?.post?.requestBody?.content["application/json"]?.schema as
+        | { readonly properties: Record<string, Record<string, unknown>> }
+        | undefined
+      return schema?.properties[name]
+    }
+
+    it("maps the _tag of errors that share a status to their encoded components", () => {
+      class UserNotFound extends Schema.TaggedError<UserNotFound>()("UserNotFound", { userId: Schema.String }) {}
+      class TeamNotFound extends Schema.TaggedError<TeamNotFound>()("TeamNotFound", { teamId: Schema.String }) {}
+      const Api = HttpApi.make("Api").add(
+        HttpApiGroup.make("test").add(
+          HttpApiEndpoint.get("get", "/get", {
+            error: [UserNotFound.pipe(HttpApiSchema.status(404)), TeamNotFound.pipe(HttpApiSchema.status(404))]
+          })
+        )
+      )
+
+      assert.deepStrictEqual(OpenApi.fromApi(Api).paths["/get"]?.get?.responses[404]?.content, {
+        "application/json": {
+          schema: {
+            anyOf: [
+              { $ref: "#/components/schemas/UserNotFoundEncoded" },
+              { $ref: "#/components/schemas/TeamNotFoundEncoded" }
+            ],
+            discriminator: {
+              propertyName: "_tag",
+              mapping: {
+                UserNotFound: "#/components/schemas/UserNotFoundEncoded",
+                TeamNotFound: "#/components/schemas/TeamNotFoundEncoded"
+              }
+            }
+          }
+        }
+      })
+    })
+
+    it("adds a discriminator to a component union and maps every literal of a member", () => {
+      const Generic = Schema.Struct({ type: Schema.Literal("generic") }).annotate({ identifier: "Generic" })
+      const Chat = Schema.Struct({ type: Schema.Literals(["slack", "discord"]) }).annotate({ identifier: "Chat" })
+      const Provider = Schema.Union([Generic, Chat], { mode: "oneOf" }).annotate({ identifier: "Provider" })
+
+      assert.deepStrictEqual(OpenApi.fromApi(makePayloadApi({ provider: Provider })).components.schemas.Provider, {
+        oneOf: [
+          { $ref: "#/components/schemas/Generic" },
+          { $ref: "#/components/schemas/Chat" }
+        ],
+        discriminator: {
+          propertyName: "type",
+          mapping: {
+            generic: "#/components/schemas/Generic",
+            slack: "#/components/schemas/Chat",
+            discord: "#/components/schemas/Chat"
+          }
+        }
+      })
+    })
+
+    it("prefers _tag when several properties select each member", () => {
+      const A = Schema.Struct({ _tag: Schema.Literal("A"), kind: Schema.Literal("x") }).annotate({ identifier: "A" })
+      const B = Schema.Struct({ _tag: Schema.Literal("B"), kind: Schema.Literal("y") }).annotate({ identifier: "B" })
+
+      const schema = getPayloadProperty(OpenApi.fromApi(makePayloadApi({ value: Schema.Union([A, B]) })), "value")
+
+      assert.deepStrictEqual(schema?.discriminator, {
+        propertyName: "_tag",
+        mapping: { A: "#/components/schemas/A", B: "#/components/schemas/B" }
+      })
+    })
+
+    it("stores a __proto__ literal as an own mapping property", () => {
+      const A = Schema.Struct({ type: Schema.Literal("__proto__") }).annotate({ identifier: "A" })
+      const B = Schema.Struct({ type: Schema.Literal("b") }).annotate({ identifier: "B" })
+
+      const schema = getPayloadProperty(OpenApi.fromApi(makePayloadApi({ value: Schema.Union([A, B]) })), "value")
+      const mapping = (schema?.discriminator as { readonly mapping: Record<string, string> } | undefined)?.mapping
+
+      assert.isTrue(mapping !== undefined && Object.hasOwn(mapping, "__proto__"))
+      assert.strictEqual(mapping?.["__proto__"], "#/components/schemas/A")
+    })
+
+    it("does not add a discriminator when no single property selects each member", () => {
+      const KindA = Schema.Struct({ kind: Schema.Literal("a"), mode: Schema.Literal("1") }).annotate({
+        identifier: "KindA"
+      })
+      const KindB = Schema.Struct({ kind: Schema.Literal("b"), mode: Schema.Literal("2") }).annotate({
+        identifier: "KindB"
+      })
+      const SameA = Schema.Struct({ type: Schema.Literal("same") }).annotate({ identifier: "SameA" })
+      const SameB = Schema.Struct({ type: Schema.Literal("same"), extra: Schema.String }).annotate({
+        identifier: "SameB"
+      })
+      const OptionalA = Schema.Struct({ type: Schema.optionalKey(Schema.Literal("a")) }).annotate({
+        identifier: "OptionalA"
+      })
+      const RequiredB = Schema.Struct({ type: Schema.Literal("b") }).annotate({ identifier: "RequiredB" })
+      const Api = makePayloadApi({
+        ambiguous: Schema.Union([KindA, KindB]),
+        inline: Schema.Union([
+          Schema.Struct({ type: Schema.Literal("a") }),
+          Schema.Struct({ type: Schema.Literal("b") })
+        ]),
+        sharedValue: Schema.Union([SameA, SameB]),
+        optionalKey: Schema.Union([OptionalA, RequiredB]),
+        nullable: Schema.NullOr(RequiredB)
+      })
+
+      const spec = OpenApi.fromApi(Api)
+
+      for (const name of ["ambiguous", "inline", "sharedValue", "optionalKey", "nullable"]) {
+        const schema = getPayloadProperty(spec, name)
+        assert.isDefined(schema?.anyOf, name)
+        assert.notProperty(schema, "discriminator", name)
+      }
+    })
+  })
 })

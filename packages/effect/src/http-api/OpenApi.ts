@@ -30,6 +30,7 @@ import type * as HttpApiGroup from "./HttpApiGroup.ts"
 import * as HttpApiMiddleware from "./HttpApiMiddleware.ts"
 import * as HttpApiSchema from "./HttpApiSchema.ts"
 import type { HttpApiSecurity } from "./HttpApiSecurity.ts"
+import * as InternalDiscriminator from "./internal/discriminator.ts"
 import * as HttpApiPath from "./internal/path.ts"
 
 /**
@@ -286,6 +287,12 @@ function processAnnotation<Services, S, I>(
  * and overrides. The optional reference policy receives canonical JSON encoded
  * ASTs and controls which schemas are extracted into components. By default, only candidates with resolved identifiers
  * become references; anonymous non-recursive schemas remain inline.
+ *
+ * A `oneOf` or `anyOf` gets a `discriminator` with an explicit `mapping` when
+ * every member is a reference to an object component and one required string
+ * literal property, such as `_tag`, selects exactly one member for each value.
+ * When several properties qualify, `_tag` is used if it is one of them;
+ * otherwise no discriminator is emitted.
  *
  * **Gotchas**
  *
@@ -694,10 +701,12 @@ function compileSchemaOps(
       : makePropertiesRepresentation(representation, document.references, op.select)
   })
   const references = selectReferences(representations, document.references)
-  const jsonSchemaMultiDocument = JsonSchema.toMultiDocumentOpenApi3_1(
-    InternalToJsonSchemaDocument.toJsonSchemaMultiDocument(
-      { representations, references },
-      { onExcessProperty: "error" }
+  const jsonSchemaMultiDocument = InternalDiscriminator.addDiscriminators(
+    JsonSchema.toMultiDocumentOpenApi3_1(
+      InternalToJsonSchemaDocument.toJsonSchemaMultiDocument(
+        { representations, references },
+        { onExcessProperty: "error" }
+      )
     )
   )
 
