@@ -1,12 +1,9 @@
 // Run from the repository root with a Node version that supports TypeScript:
 // node packages/effect/examples/cluster-workflow-lost-wakeup.ts
-// node packages/effect/examples/cluster-workflow-lost-wakeup.ts single
-// node packages/effect/examples/cluster-workflow-lost-wakeup.ts cluster
 //
-// The default runs both engines sequentially. "single" uses WorkflowEngine.layerMemory;
-// "cluster" uses ClusterWorkflowEngine with memory storage and no-op runners.
-// Both modes run in one process. Hooks control the callback timing; sleeps only
-// observe whether the parent makes further progress.
+// ClusterWorkflowEngine runs in one process with memory storage and no-op runners.
+// Storage hooks control the callback timing; sleeps only observe whether the
+// parent makes further progress.
 import { Effect, Latch, Layer, Option, Schedule, Schema } from "effect"
 import {
   ClusterWorkflowEngine,
@@ -17,10 +14,10 @@ import {
   Sharding,
   ShardingConfig
 } from "effect/cluster"
-import { Activity, DurableDeferred, Workflow, WorkflowEngine } from "effect/workflow"
+import { Activity, DurableDeferred, Workflow } from "effect/workflow"
 import * as NodeRuntime from "../../platform/node/src/NodeRuntime.ts"
 
-const runMode = Effect.fn("runMode")(function*(mode: "single" | "cluster") {
+const program = Effect.gen(function*() {
   const activitySuspended = yield* Latch.make()
   const callbackSaved = yield* Latch.make()
   const siblingStarted = yield* Latch.make()
@@ -35,17 +32,8 @@ const runMode = Effect.fn("runMode")(function*(mode: "single" | "cluster") {
   const activityA = Activity.make({
     name: "A",
     success: Schema.String,
-    // Ensure B is active before A can suspend, even when activities run inline.
-    execute: siblingStarted.await.pipe(
-      Effect.andThen(DurableDeferred.await(callback)),
-      // The memory engine runs the body directly and has no persisted replies.
-      Effect.onExit(() =>
-        mode === "single"
-          ? Effect.flatMap(WorkflowEngine.WorkflowInstance, (instance) =>
-            instance.suspended ? activitySuspended.open : Effect.void)
-          : Effect.void
-      )
-    )
+    // Ensure B is active before A can suspend.
+    execute: siblingStarted.await.pipe(Effect.andThen(DurableDeferred.await(callback)))
   })
   const activityB = Activity.make({
     name: "B",
@@ -74,7 +62,7 @@ const runMode = Effect.fn("runMode")(function*(mode: "single" | "cluster") {
     }))
   ).pipe(Layer.provide(MessageStorage.layerMemory))
 
-  const clusterEngineLayer = ClusterWorkflowEngine.layer.pipe(
+  const engineLayer = ClusterWorkflowEngine.layer.pipe(
     Layer.provideMerge(Sharding.layer),
     Layer.provide(Runners.layerNoop),
     Layer.provideMerge(storageLayer),
@@ -88,18 +76,16 @@ const runMode = Effect.fn("runMode")(function*(mode: "single" | "cluster") {
       sendRetryInterval: 10
     }))
   )
-  const engineLayer = mode === "single" ? WorkflowEngine.layerMemory : clusterEngineLayer
   const workflowLayer = workflow.toLayer(() => Effect.all([activityA, activityB], { concurrency: "unbounded" })).pipe(
     Layer.provideMerge(engineLayer)
   )
 
-  return yield* Effect.gen(function*() {
+  yield* Effect.gen(function*() {
     yield* Effect.addFinalizer(() => releaseB.open)
-    const sharding = yield* Effect.serviceOption(Sharding.Sharding)
-    const pollStorage = Option.isSome(sharding) ? sharding.value.pollStorage : Effect.void
+    const sharding = yield* Sharding.Sharding
     // A normal execute waiter can retry Suspended and hide the lost wakeup.
     const executionId = yield* workflow.execute({}, { discard: true })
-    const poll = pollStorage.pipe(Effect.andThen(workflow.poll(executionId)))
+    const poll = sharding.pollStorage.pipe(Effect.andThen(workflow.poll(executionId)))
     const waitForReply = (tag?: "Complete") =>
       poll.pipe(
         Effect.repeat({
@@ -110,14 +96,9 @@ const runMode = Effect.fn("runMode")(function*(mode: "single" | "cluster") {
         Effect.map(Option.getOrThrow)
       )
 
-    console.log(`\n[${mode}]`)
     console.log("1. Started the workflow with discard: true.")
     yield* Effect.all([activitySuspended.await, siblingStarted.await]).pipe(Effect.timeout("5 seconds"))
-    console.log(
-      mode === "cluster"
-        ? "2. A's Suspended reply is saved; B is still running."
-        : "2. A has suspended; B is still running."
-    )
+    console.log("2. A's Suspended reply is saved; B is still running.")
     const beforeCallback = yield* poll
     if (Option.isSome(beforeCallback)) {
       return yield* Effect.fail(new Error("Expected the parent to still be active while B is blocked"))
@@ -128,12 +109,8 @@ const runMode = Effect.fn("runMode")(function*(mode: "single" | "cluster") {
       token: DurableDeferred.tokenFromExecutionId(callback, { workflow, executionId }),
       value: "A done"
     })
-    if (mode === "cluster") yield* callbackSaved.await.pipe(Effect.timeout("5 seconds"))
-    console.log(
-      mode === "cluster"
-        ? "3. Callback reply is persisted while B is still running."
-        : "3. Callback is recorded in memory while B is still running."
-    )
+    yield* callbackSaved.await.pipe(Effect.timeout("5 seconds"))
+    console.log("3. Callback reply is persisted while B is still running.")
 
     yield* releaseB.open
     console.log("4. Released B. Polling the parent without an execute waiter:")
@@ -150,7 +127,7 @@ const runMode = Effect.fn("runMode")(function*(mode: "single" | "cluster") {
     if (result.value._tag === "Complete") {
       console.log("Automatic completion succeeded; the lost wakeup did not reproduce.")
       console.log("Result:", yield* result.value.exit)
-      return "completed automatically"
+      return
     }
 
     console.log("BUG: parent remains Suspended even though the callback is recorded and B has finished.")
@@ -160,19 +137,7 @@ const runMode = Effect.fn("runMode")(function*(mode: "single" | "cluster") {
       console.log("5. Manual resume completed the workflow.")
       console.log("Result:", yield* recovered.exit)
     }
-    return "stuck until manual resume"
   }).pipe(Effect.provide(workflowLayer))
 })
 
-const program = Effect.gen(function*() {
-  const mode = yield* Schema.decodeUnknownEffect(Schema.Literals(["single", "cluster", "both"]))(
-    process.argv[2] ?? "both"
-  )
-  const modes: ReadonlyArray<"single" | "cluster"> = mode === "both" ? ["single", "cluster"] : [mode]
-  for (const selected of modes) {
-    const outcome = yield* runMode(selected).pipe(Effect.scoped, Effect.timeout("20 seconds"))
-    console.log(`[${selected}] ${outcome}`)
-  }
-})
-
-NodeRuntime.runMain(program)
+NodeRuntime.runMain(program.pipe(Effect.scoped, Effect.timeout("20 seconds")))
