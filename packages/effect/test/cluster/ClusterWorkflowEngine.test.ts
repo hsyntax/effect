@@ -1293,6 +1293,89 @@ describe.concurrent("ClusterWorkflowEngine", () => {
   )
 
   it.effect(
+    "DurableClock.sleep resumes a discarded execution when an activity sleeps beside an active sibling",
+    () =>
+      Effect.gen(function*() {
+        const activitySuspended = yield* Latch.make()
+        const siblingStarted = yield* Latch.make()
+        const clockFired = yield* Latch.make()
+        let siblingFinished = false
+        const workflow = Workflow.make("ParallelActivitySleep", {
+          payload: {},
+          success: Schema.Array(Schema.String),
+          idempotencyKey: () => "one"
+        })
+        const sleepingActivity = Activity.make({
+          name: "durable-sleep",
+          success: Schema.String,
+          // A zero threshold keeps this short sleep on the durable clock.
+          execute: DurableClock.sleep({ name: "timer", duration: 5000, inMemoryThreshold: Duration.zero }).pipe(
+            Effect.as("slept")
+          )
+        })
+        const sibling = Activity.make({
+          name: "active-sibling",
+          success: Schema.String,
+          execute: siblingStarted.open.pipe(
+            Effect.andThen(Effect.sleep("30 seconds")),
+            Effect.andThen(Effect.sync(() => {
+              siblingFinished = true
+            })),
+            Effect.as("sibling")
+          )
+        })
+        const storageLayer = Layer.effect(
+          MessageStorage.MessageStorage,
+          Effect.map(MessageStorage.MessageStorage, (storage) => ({
+            ...storage,
+            // The clock wakes the workflow by completing the sleep's deferred.
+            saveRequest: (request) =>
+              storage.saveRequest(request).pipe(
+                Effect.tap(() => request.rpc._tag === "deferred" ? clockFired.open : Effect.void)
+              ),
+            saveReply: (reply) =>
+              storage.saveReply(reply).pipe(
+                Effect.tap(() =>
+                  reply.rpc._tag === "activity" && reply.reply._tag === "WithExit" &&
+                    reply.reply.exit._tag === "Success" && Schema.is(Workflow.Suspended)(reply.reply.exit.value)
+                    ? activitySuspended.open
+                    : Effect.void
+                )
+              )
+          }))
+        ).pipe(Layer.provide(MessageStorage.layerMemory))
+        const context = yield* Layer.build(
+          workflow.toLayer(() => Effect.all([sleepingActivity, sibling], { concurrency: "unbounded" })).pipe(
+            Layer.provideMerge(makeTestWorkflowEngine({ storageLayer }))
+          )
+        )
+        yield* Effect.gen(function*() {
+          const sharding = yield* Sharding.Sharding
+          // No caller waits on the result, so only the clock can wake the run.
+          const executionId = yield* workflow.execute({}, { discard: true })
+          yield* advanceUntil(
+            () => activitySuspended.isOpen() && siblingStarted.isOpen(),
+            "the sleeping activity must have a stored Suspended reply while its sibling is active"
+          )
+          assert.deepStrictEqual(yield* workflow.poll(executionId), Option.none())
+          // The sleep elapses 25 seconds before the sibling finishes.
+          yield* TestClock.adjust(5000)
+          yield* sharding.pollStorage
+          yield* advanceUntil(() => clockFired.isOpen(), "the durable clock must complete the sleep's deferred")
+          assert.isFalse(siblingFinished)
+          // The parent still has no reply for the clock's wake to reset.
+          assert.deepStrictEqual(yield* workflow.poll(executionId), Option.none())
+          yield* advanceUntil(() => siblingFinished, "the sibling must finish after the clock fired", 1000, 60)
+          assert.deepStrictEqual(
+            yield* pollUntil(workflow, executionId, "Complete"),
+            new Workflow.Complete({ exit: Exit.succeed(["slept", "sibling"]) })
+          )
+        }).pipe(Effect.provide(context))
+      }),
+    20_000
+  )
+
+  it.effect(
     "DurableDeferred resumes a discarded execution when completion precedes the suspension commit",
     () =>
       Effect.gen(function*() {
