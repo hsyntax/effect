@@ -80,31 +80,51 @@ const program = Effect.gen(function*() {
     Layer.provideMerge(engineLayer)
   )
 
-  yield* Effect.gen(function*() {
-    yield* Effect.addFinalizer(() => releaseB.open)
+  const readParent = Effect.fnUntraced(function*(executionId: string) {
     const sharding = yield* Sharding.Sharding
-    // A normal execute waiter can retry Suspended and hide the lost wakeup.
-    const executionId = yield* workflow.execute({}, { discard: true })
-    const poll = sharding.pollStorage.pipe(Effect.andThen(workflow.poll(executionId)))
-    const waitForReply = (tag?: "Complete") =>
-      poll.pipe(
-        Effect.repeat({
-          schedule: Schedule.spaced("20 millis"),
-          until: (result) => Option.isSome(result) && (tag === undefined || result.value._tag === tag)
-        }),
-        Effect.timeout("5 seconds"),
-        Effect.map(Option.getOrThrow)
-      )
+    yield* sharding.pollStorage
+    return yield* workflow.poll(executionId)
+  })
 
-    console.log("1. Started the workflow with discard: true.")
+  const waitForParent = (executionId: string, tag?: "Complete") =>
+    readParent(executionId).pipe(
+      Effect.repeat({
+        schedule: Schedule.spaced("20 millis"),
+        until: (reply) => {
+          if (Option.isNone(reply)) return false
+          return tag === undefined || reply.value._tag === tag
+        }
+      }),
+      Effect.timeout("5 seconds"),
+      Effect.map(Option.getOrThrow)
+    )
+
+  const observeParent = Effect.fnUntraced(function*(executionId: string) {
+    let reply = yield* waitForParent(executionId)
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      yield* Effect.sleep("300 millis")
+      reply = yield* waitForParent(executionId)
+      console.log(`   Poll ${attempt}: ${reply._tag}`)
+    }
+    return reply
+  })
+
+  const demonstrate = Effect.gen(function*() {
+    yield* Effect.addFinalizer(() => releaseB.open)
+
+    // 1. Start without an execute waiter that could retry and hide the bug.
+    console.log("1. Start the workflow with discard: true.")
+    const executionId = yield* workflow.execute({}, { discard: true })
+
+    // 2. Establish the race: A has suspended, but B keeps the parent active.
     yield* Effect.all([activitySuspended.await, siblingStarted.await]).pipe(Effect.timeout("5 seconds"))
-    console.log("2. A's Suspended reply is saved; B is still running.")
-    const beforeCallback = yield* poll
+    const beforeCallback = yield* readParent(executionId)
     if (Option.isSome(beforeCallback)) {
       return yield* Effect.fail(new Error("Expected the parent to still be active while B is blocked"))
     }
-    console.log("   Parent: active, with no completed or suspended result yet.")
+    console.log("2. A's Suspended reply is saved. B and the parent are still active.")
 
+    // 3. Deliver and persist the callback before allowing B to finish.
     yield* DurableDeferred.succeed(callback, {
       token: DurableDeferred.tokenFromExecutionId(callback, { workflow, executionId }),
       value: "A done"
@@ -112,32 +132,27 @@ const program = Effect.gen(function*() {
     yield* callbackSaved.await.pipe(Effect.timeout("5 seconds"))
     console.log("3. Callback reply is persisted while B is still running.")
 
+    // 4. Finish B and observe whether the parent can complete by itself.
     yield* releaseB.open
-    console.log("4. Released B. Polling the parent without an execute waiter:")
-    yield* waitForReply()
-    let result = yield* poll
-    for (let i = 1; i <= 3; i++) {
-      yield* Effect.sleep("300 millis")
-      result = yield* poll
-      console.log(`   Poll ${i}: ${Option.isSome(result) ? result.value._tag : "still active"}`)
-    }
-    if (Option.isNone(result)) {
-      return yield* Effect.fail(new Error("Parent is still active after the observation window"))
-    }
-    if (result.value._tag === "Complete") {
+    console.log("4. B is released. Observing the parent:")
+    const parent = yield* observeParent(executionId)
+    if (parent._tag === "Complete") {
       console.log("Automatic completion succeeded; the lost wakeup did not reproduce.")
-      console.log("Result:", yield* result.value.exit)
+      console.log("Result:", yield* parent.exit)
       return
     }
 
+    // 5. A manual resume recovers the same execution using the saved results.
     console.log("BUG: parent remains Suspended even though the callback is recorded and B has finished.")
     yield* workflow.resume(executionId)
-    const recovered = yield* waitForReply("Complete")
+    const recovered = yield* waitForParent(executionId, "Complete")
     if (recovered._tag === "Complete") {
       console.log("5. Manual resume completed the workflow.")
       console.log("Result:", yield* recovered.exit)
     }
-  }).pipe(Effect.provide(workflowLayer))
+  })
+
+  yield* demonstrate.pipe(Effect.provide(workflowLayer))
 })
 
 NodeRuntime.runMain(program.pipe(Effect.scoped, Effect.timeout("20 seconds")))
