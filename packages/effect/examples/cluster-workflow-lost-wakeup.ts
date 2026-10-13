@@ -22,50 +22,60 @@ const program = Effect.gen(function*() {
   const callbackSaved = yield* Latch.make()
   const siblingStarted = yield* Latch.make()
   const releaseB = yield* Latch.make()
-  const callback = DurableDeferred.make("LostWakeup/Callback", { success: Schema.String })
-  const workflow = Workflow.make("LostWakeup", {
+  const Callback = DurableDeferred.make("LostWakeupWorkflow/Callback", { success: Schema.String })
+  const LostWakeupWorkflow = Workflow.make("LostWakeupWorkflow", {
     payload: {},
     success: Schema.Array(Schema.String),
     idempotencyKey: () => "one"
   })
 
-  const activityA = Activity.make({
-    name: "A",
+  // Activity A suspends on the provider callback while activity B remains active.
+  const AwaitCallback = Activity.make({
+    name: "AwaitCallback",
     success: Schema.String,
-    // Ensure B is active before A can suspend.
-    execute: siblingStarted.await.pipe(Effect.andThen(DurableDeferred.await(callback)))
+    execute: Effect.gen(function*() {
+      yield* siblingStarted.await
+      return yield* DurableDeferred.await(Callback)
+    })
   })
-  const activityB = Activity.make({
-    name: "B",
+  const WaitForRelease = Activity.make({
+    name: "WaitForRelease",
     success: Schema.String,
-    execute: siblingStarted.open.pipe(Effect.andThen(releaseB.await), Effect.as("B done"))
+    execute: Effect.gen(function*() {
+      yield* siblingStarted.open
+      yield* releaseB.await
+      return "B done"
+    })
   })
 
   // Observe actual commits, rather than guessing when A or the callback finishes.
-  const storageLayer = Layer.effect(
+  const StorageLayer = Layer.effect(
     MessageStorage.MessageStorage,
-    Effect.map(MessageStorage.MessageStorage, (storage) => ({
-      ...storage,
-      saveReply: (reply) =>
-        storage.saveReply(reply).pipe(
-          Effect.tap(() => {
-            if (reply.rpc._tag === "deferred") return callbackSaved.open
-            if (
-              reply.rpc._tag === "activity" && reply.reply._tag === "WithExit" &&
-              reply.reply.exit._tag === "Success" && Schema.is(Workflow.Suspended)(reply.reply.exit.value)
-            ) {
-              return activitySuspended.open
-            }
-            return Effect.void
-          })
-        )
-    }))
+    Effect.gen(function*() {
+      const storage = yield* MessageStorage.MessageStorage
+      return MessageStorage.MessageStorage.of({
+        ...storage,
+        saveReply: (reply) =>
+          storage.saveReply(reply).pipe(
+            Effect.tap(() => {
+              if (reply.rpc._tag === "deferred") return callbackSaved.open
+              if (
+                reply.rpc._tag === "activity" && reply.reply._tag === "WithExit" &&
+                reply.reply.exit._tag === "Success" && Schema.is(Workflow.Suspended)(reply.reply.exit.value)
+              ) {
+                return activitySuspended.open
+              }
+              return Effect.void
+            })
+          )
+      })
+    })
   ).pipe(Layer.provide(MessageStorage.layerMemory))
 
-  const engineLayer = ClusterWorkflowEngine.layer.pipe(
+  const WorkflowEngineLayer = ClusterWorkflowEngine.layer.pipe(
     Layer.provideMerge(Sharding.layer),
     Layer.provide(Runners.layerNoop),
-    Layer.provideMerge(storageLayer),
+    Layer.provideMerge(StorageLayer),
     Layer.provide(RunnerStorage.layerMemory),
     Layer.provide(RunnerHealth.layerNoop),
     Layer.provide(ShardingConfig.layer({
@@ -76,14 +86,16 @@ const program = Effect.gen(function*() {
       sendRetryInterval: 10
     }))
   )
-  const workflowLayer = workflow.toLayer(() => Effect.all([activityA, activityB], { concurrency: "unbounded" })).pipe(
-    Layer.provideMerge(engineLayer)
+  const LostWakeupWorkflowLayer = LostWakeupWorkflow.toLayer(() =>
+    Effect.all([AwaitCallback, WaitForRelease], { concurrency: "unbounded" })
+  ).pipe(
+    Layer.provideMerge(WorkflowEngineLayer)
   )
 
   const readParent = Effect.fnUntraced(function*(executionId: string) {
     const sharding = yield* Sharding.Sharding
     yield* sharding.pollStorage
-    return yield* workflow.poll(executionId)
+    return yield* LostWakeupWorkflow.poll(executionId)
   })
 
   const waitForParent = (executionId: string, tag?: "Complete") =>
@@ -114,7 +126,7 @@ const program = Effect.gen(function*() {
 
     // 1. Start without an execute waiter that could retry and hide the bug.
     console.log("1. Start the workflow with discard: true.")
-    const executionId = yield* workflow.execute({}, { discard: true })
+    const executionId = yield* LostWakeupWorkflow.execute({}, { discard: true })
 
     // 2. Establish the race: A has suspended, but B keeps the parent active.
     yield* Effect.all([activitySuspended.await, siblingStarted.await]).pipe(Effect.timeout("5 seconds"))
@@ -125,8 +137,8 @@ const program = Effect.gen(function*() {
     console.log("2. A's Suspended reply is saved. B and the parent are still active.")
 
     // 3. Deliver and persist the callback before allowing B to finish.
-    yield* DurableDeferred.succeed(callback, {
-      token: DurableDeferred.tokenFromExecutionId(callback, { workflow, executionId }),
+    yield* DurableDeferred.succeed(Callback, {
+      token: DurableDeferred.tokenFromExecutionId(Callback, { workflow: LostWakeupWorkflow, executionId }),
       value: "A done"
     })
     yield* callbackSaved.await.pipe(Effect.timeout("5 seconds"))
@@ -144,7 +156,7 @@ const program = Effect.gen(function*() {
 
     // 5. A manual resume recovers the same execution using the saved results.
     console.log("BUG: parent remains Suspended even though the callback is recorded and B has finished.")
-    yield* workflow.resume(executionId)
+    yield* LostWakeupWorkflow.resume(executionId)
     const recovered = yield* waitForParent(executionId, "Complete")
     if (recovered._tag === "Complete") {
       console.log("5. Manual resume completed the workflow.")
@@ -152,7 +164,7 @@ const program = Effect.gen(function*() {
     }
   })
 
-  yield* demonstrate.pipe(Effect.provide(workflowLayer))
+  yield* demonstrate.pipe(Effect.provide(LostWakeupWorkflowLayer))
 })
 
 NodeRuntime.runMain(program.pipe(Effect.scoped, Effect.timeout("20 seconds")))
