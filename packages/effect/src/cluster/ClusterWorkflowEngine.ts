@@ -444,6 +444,12 @@ export const make = Effect.gen(function*() {
             let currentRun: {
               readonly request: Entity.Request<any>
               readonly instance: WorkflowEngine.WorkflowInstance["Service"]
+              // A completion arrived that this run did not await itself. One of
+              // its activities may have read the result as missing, so the run
+              // replays instead of suspending.
+              replayOnSuspend: boolean
+              // The run has chosen its result and can no longer replay itself.
+              settled: boolean
             } | undefined
             // Concurrent wakes share one wait for the current run to publish its reply.
             const resumeGate = Semaphore.makeUnsafe(1)
@@ -458,9 +464,10 @@ export const make = Effect.gen(function*() {
               ensureSuccess
             )
             return {
-              run: (request: Entity.Request<any>) => {
+              run: function run(request: Entity.Request<any>): Effect.Effect<any> {
                 const instance = WorkflowEngine.WorkflowInstance.initial(workflow, executionId)
-                currentRun = { request, instance }
+                const current = { request, instance, replayOnSuspend: false, settled: false }
+                currentRun = current
                 const parent = (request.payload as any)[payloadParentKey] as
                   | { workflowName: string; executionId: string }
                   | undefined
@@ -499,7 +506,16 @@ export const make = Effect.gen(function*() {
                   Workflow.intoResult,
                   (effect) => deferredState.trackRun(instance, effect),
                   // Request middleware and local callers may carry another entity's context.
-                  Effect.provideService(CurrentActivationScope, activation)
+                  Effect.provideService(CurrentActivationScope, activation),
+                  Effect.flatMap((result) => {
+                    // A completion acknowledged during this run found no reply to
+                    // reset. Replay here to read it, before the suspension is stored.
+                    if (result._tag === "Suspended" && current.replayOnSuspend) {
+                      return Effect.suspend(() => run(request))
+                    }
+                    current.settled = true
+                    return Effect.succeed(result)
+                  })
                 ) as any
               },
 
@@ -552,13 +568,19 @@ export const make = Effect.gen(function*() {
                 // a later await would require waiting for its reply before reset.
                 // A run completing its own deferred also reads it from the cache
                 // when it awaits later, so that completion never wakes the run.
-                const wake = Effect.suspend(() =>
-                  currentRun && !currentRun.instance.awaitedDeferreds.has(payload.name)
-                    ? currentRun.instance.completedDeferreds.has(payload.name)
-                      ? Effect.void
-                      : ensureSuccess(resume(workflow, executionId))
-                    : deferredState.deferredDone(executionId, payload.name).pipe(Effect.andThen(resumeCurrentRun))
-                )
+                // An activity awaits on its own instance, so it may already have
+                // read the result as missing and reported Suspended. Mark the run
+                // to replay instead of suspending. A settled run cannot check the
+                // mark again, so wait for its reply before resetting it.
+                const wake = Effect.suspend(() => {
+                  if (!currentRun || currentRun.instance.awaitedDeferreds.has(payload.name)) {
+                    return deferredState.deferredDone(executionId, payload.name).pipe(Effect.andThen(resumeCurrentRun))
+                  }
+                  if (currentRun.instance.completedDeferreds.has(payload.name)) return Effect.void
+                  if (currentRun.settled) return resumeCurrentRun
+                  currentRun.replayOnSuspend = true
+                  return ensureSuccess(resume(workflow, executionId))
+                })
                 // An asynchronous reply releases the RPC concurrency permit while
                 // the wake waits; the pending request still occupies mailbox capacity.
                 // The activation owns the wake so it survives handler rebuilds,
